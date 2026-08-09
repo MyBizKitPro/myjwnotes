@@ -66,6 +66,7 @@ const I18N = {
     new: 'New',
     export: 'Export',
     record: 'Record',
+    recordNew: 'Record new',
     stop: 'Stop',
     listening: 'Listening…',
     tapToRecord: 'Tap to record',
@@ -134,6 +135,7 @@ const I18N = {
     new: 'Bago',
     export: 'I-export',
     record: 'Mag-record',
+    recordNew: 'Bagong record',
     stop: 'Itigil',
     listening: 'Nakikinig…',
     tapToRecord: 'Pindutin para mag-record',
@@ -281,6 +283,43 @@ const blobToBase64 = (blob) => new Promise((resolve, reject) => {
   reader.onerror = () => reject(new Error('Could not read the recorded audio'));
   reader.readAsDataURL(blob);
 });
+
+// ---------------- Pending audio queue (IndexedDB) ----------------
+// Kingdom halls have poor reception, so a recorded segment must survive a
+// failed upload. Audio blobs are far too big for localStorage, and holding
+// them in memory would lose them on reload — so unsent segments go to
+// IndexedDB and are retried when the network comes back.
+const AUDIO_DB = 'myjwnotes-audio';
+const AUDIO_STORE = 'pending';
+
+const openAudioDB = () => new Promise((resolve, reject) => {
+  if (typeof indexedDB === 'undefined') { reject(new Error('No IndexedDB')); return; }
+  const req = indexedDB.open(AUDIO_DB, 1);
+  req.onupgradeneeded = () => {
+    const db = req.result;
+    if (!db.objectStoreNames.contains(AUDIO_STORE)) {
+      db.createObjectStore(AUDIO_STORE, { keyPath: 'id', autoIncrement: true });
+    }
+  };
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error || new Error('Could not open audio store'));
+});
+
+const audioTx = async (mode, run) => {
+  const db = await openAudioDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(AUDIO_STORE, mode);
+    const store = tx.objectStore(AUDIO_STORE);
+    let result;
+    try { result = run(store); } catch (e) { reject(e); return; }
+    tx.oncomplete = () => resolve(result?.result !== undefined ? result.result : result);
+    tx.onerror = () => reject(tx.error);
+  });
+};
+
+const queueSegment = (record) => audioTx('readwrite', (s) => s.add(record));
+const listSegments = () => audioTx('readonly', (s) => s.getAll());
+const dropSegment = (id) => audioTx('readwrite', (s) => s.delete(id));
 
 // Length of each recorded chunk in fallback mode. Short enough that text lands
 // in the notes while you are still studying, and that no upload nears 25MB.
@@ -1205,7 +1244,9 @@ export default function BibleStudyApp() {
   const [contentLanguage, setContentLanguage] = useState('tl');
   const [isRecording, setIsRecording] = useState(false);
   const [interim, setInterim] = useState('');
-  const [showSessions, setShowSessions] = useState(false);
+  // Home is the app's real first screen; the editor is navigated into and back
+  // out of, rather than being a modal layered over a blank study.
+  const [view, setView] = useState('home'); // 'home' | 'editor'
   const [showSettings, setShowSettings] = useState(false);
   const [showTemplatePicker, setShowTemplatePicker] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -1233,6 +1274,10 @@ export default function BibleStudyApp() {
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summaryError, setSummaryError] = useState('');
   const [copiedSummary, setCopiedSummary] = useState(''); // '' | 'ok' | 'fail'
+  const [pendingCount, setPendingCount] = useState(0);   // segments waiting for a network
+  const [flushing, setFlushing] = useState(false);
+  const [backupMsg, setBackupMsg] = useState('');
+  const [isOnline, setIsOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine !== false);
 
   const recognitionRef = useRef(null);
   const shouldKeepListeningRef = useRef(false);
@@ -1247,6 +1292,9 @@ export default function BibleStudyApp() {
   const recModeRef = useRef(recMode);
   useEffect(() => { recModeRef.current = recMode; }, [recMode]);
   const wakeLockRef = useRef(null);
+  const recSessionIdRef = useRef(null);
+  const activeSessionIdRef = useRef(activeSessionId);
+  useEffect(() => { activeSessionIdRef.current = activeSessionId; }, [activeSessionId]);
 
   // ---------------- Load fonts ----------------
   useEffect(() => {
@@ -1436,34 +1484,129 @@ export default function BibleStudyApp() {
   };
 
   // ---------------- Fallback: record audio, transcribe server-side ----------------
-  const uploadSegment = async (blob, type) => {
+  // Give the session a stable id before recording so queued audio can be routed
+  // back to the right note even if it's transcribed hours later.
+  const ensureSessionId = () => {
+    if (activeSessionIdRef.current) return activeSessionIdRef.current;
+    const id = `s_${Date.now()}`;
+    activeSessionIdRef.current = id;
+    setActiveSessionId(id);
+    return id;
+  };
+
+  // Route transcribed text to the right note — the open one, or a stored one if
+  // the user has since moved on.
+  const appendTranscriptTo = (sessionId, text) => {
+    const clean = (text || '').trim();
+    if (!clean) return;
+    if (!sessionId || sessionId === activeSessionIdRef.current) { appendTranscript(clean); return; }
+    setSessions(prev => {
+      const next = prev.map(s => {
+        if (s.id !== sessionId) return s;
+        const needsSpace = s.notes && !s.notes.endsWith(' ') && !s.notes.endsWith('\n');
+        return { ...s, notes: (s.notes || '') + (needsSpace ? ' ' : '') + clean + ' ', updatedAt: Date.now() };
+      });
+      storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
+  };
+
+  const refreshPendingCount = async () => {
+    try { setPendingCount((await listSegments()).length); } catch (e) { /* no IndexedDB */ }
+  };
+
+  const transcribeBlob = async (blob, type) => {
+    const base64 = await blobToBase64(blob);
+    const response = await fetch('/api/transcribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        audio: base64,
+        mimeType: type,
+        // Omitted entirely when blank, so the server lets the model auto-detect.
+        language: TRANSCRIBE_LANG[contentLanguage] || undefined,
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Transcription failed (${response.status})`);
+    return data.text;
+  };
+
+  const stashSegment = async (blob, type, sessionId, attempts = 0) => {
+    try {
+      await queueSegment({ blob, type, sessionId, attempts, at: Date.now() });
+      await refreshPendingCount();
+      return true;
+    } catch (e) {
+      setRecError('That segment could not be saved for later — this browser blocked offline storage.');
+      return false;
+    }
+  };
+
+  const uploadSegment = async (blob, type, sessionId) => {
     // A container with no speech in it still weighs a couple of KB.
     if (!blob || blob.size < 2000) return;
+    // Offline: don't even try — bank it straight away.
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      await stashSegment(blob, type, sessionId);
+      return;
+    }
     setTranscribing(n => n + 1);
     try {
-      const base64 = await blobToBase64(blob);
-      const response = await fetch('/api/transcribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          audio: base64,
-          mimeType: type,
-          // Omitted entirely when blank, so the server lets the model auto-detect.
-          language: TRANSCRIBE_LANG[contentLanguage] || undefined,
-        }),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        setRecError(data.error || 'Transcription failed for that segment.');
-        return;
-      }
-      appendTranscript(data.text);
+      appendTranscriptTo(sessionId, await transcribeBlob(blob, type));
     } catch (e) {
-      setRecError('Could not reach the transcription service — that segment was lost. Check your connection.');
+      // Never drop audio on a failure — bank it and retry when there's signal.
+      const saved = await stashSegment(blob, type, sessionId);
+      if (saved) setRecNotice('No connection — audio is saved and will be transcribed when you\'re back online.');
     } finally {
       setTranscribing(n => n - 1);
     }
   };
+
+  // Retry everything banked, oldest first. Safe to call repeatedly.
+  const flushPending = async () => {
+    if (flushing) return;
+    setFlushing(true);
+    try {
+      const queued = await listSegments();
+      for (const item of queued) {
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) break;
+        try {
+          appendTranscriptTo(item.sessionId, await transcribeBlob(item.blob, item.type));
+          await dropSegment(item.id);
+        } catch (e) {
+          const attempts = (item.attempts || 0) + 1;
+          if (attempts >= 5) {
+            // Five failures is not a bad network — surface it and stop retrying.
+            await dropSegment(item.id);
+            setRecError(`A saved segment could not be transcribed after several tries and was discarded. ${e.message}`);
+          } else {
+            await dropSegment(item.id);
+            await stashSegment(item.blob, item.type, item.sessionId, attempts);
+            break; // still failing; leave the rest for the next attempt
+          }
+        }
+      }
+    } catch (e) {
+      /* store unavailable */
+    } finally {
+      await refreshPendingCount();
+      setFlushing(false);
+    }
+  };
+
+  // Count what's waiting on load, and drain automatically when signal returns.
+  useEffect(() => {
+    refreshPendingCount();
+    const goOnline = () => { setIsOnline(true); flushPending(); };
+    const goOffline = () => setIsOnline(false);
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
+  }, []); // eslint-disable-line
 
   // Records in fixed-length segments rather than one long file: text lands in
   // the notes while you are still studying, and no upload approaches the API's
@@ -1487,7 +1630,7 @@ export default function BibleStudyApp() {
       const type = mr.mimeType || mime || 'audio/webm';
       const blob = new Blob(chunksRef.current, { type });
       chunksRef.current = [];
-      uploadSegment(blob, type);
+      uploadSegment(blob, type, recSessionIdRef.current);
       if (keepSegmentingRef.current && mediaStreamRef.current) {
         startSegment(mediaStreamRef.current);
       } else {
@@ -1512,6 +1655,7 @@ export default function BibleStudyApp() {
     }
     const access = await ensureMicAccess({ keep: true });
     if (!access.ok) { setRecError(access.message); return false; }
+    recSessionIdRef.current = ensureSessionId();
     mediaStreamRef.current = access.stream;
     keepSegmentingRef.current = true;
     startSegment(access.stream);
@@ -1641,6 +1785,14 @@ export default function BibleStudyApp() {
       setRecError('Recording needs a secure connection. Open the site over https:// (or on localhost).');
       return;
     }
+    // Live transcription is a network service — it cannot work without signal.
+    // Offline, go straight to recording audio for later.
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      if (recModeRef.current !== 'upload') { setRecMode('upload'); recModeRef.current = 'upload'; }
+      setRecNotice('No connection — recording audio now, and it will be transcribed automatically when you\'re back online.');
+      await startUploadRecording();
+      return;
+    }
     if (recModeRef.current === 'upload' || !LIVE_SPEECH_USABLE) {
       if (recModeRef.current !== 'upload') {
         setRecMode('upload');
@@ -1677,6 +1829,15 @@ export default function BibleStudyApp() {
     setRecNotice('');
     if (isRecording) { stopRecording(); return; }
     // Taken inside the tap, before any await, so the gesture is still live.
+    requestWakeLock();
+    startRecording();
+  };
+
+  // Home screen's primary action: blank study, straight into recording.
+  const startNewRecording = () => {
+    newSession(null);
+    setRecError('');
+    setRecNotice('');
     requestWakeLock();
     startRecording();
   };
@@ -1746,6 +1907,9 @@ export default function BibleStudyApp() {
   // ---------------- New / load / delete sessions ----------------
   const newSession = (template = null) => {
     if (isRecording) toggleRecording();
+    // Keep the ref in step synchronously — queued audio is routed by it, and a
+    // stale value would file the transcript against the previous note.
+    activeSessionIdRef.current = null;
     setActiveSessionId(null);
     if (template && template.id !== 'blank') {
       const trans = template[contentLanguage] || template.en;
@@ -1761,13 +1925,14 @@ export default function BibleStudyApp() {
     setSummary(null);
     setSummaryError('');
     setExpandedRef(null);
-    setShowSessions(false);
+    setView('editor');
     setShowTemplatePicker(false);
     setTagInput('');
   };
 
   const loadSession = (s) => {
     if (isRecording) toggleRecording();
+    activeSessionIdRef.current = s.id;
     setActiveSessionId(s.id);
     setTitle(s.title || '');
     setNotes(s.notes || '');
@@ -1775,7 +1940,7 @@ export default function BibleStudyApp() {
     setSummary(s.summary || null);
     setTags(s.tags || []);
     setSummaryError('');
-    setShowSessions(false);
+    setView('editor');
     setExpandedRef(null);
     setTagInput('');
   };
@@ -2110,6 +2275,53 @@ ${corpus}`;
     URL.revokeObjectURL(url);
   };
 
+  // ---------------- Backup: export / import every note ----------------
+  // Everything lives in this browser's localStorage. Clearing site data or
+  // reinstalling the home-screen app wipes it with no warning and no recovery,
+  // so a portable file is the only real safety net.
+  const exportAllSessions = () => {
+    const payload = {
+      app: 'myJWnotes',
+      formatVersion: 1,
+      exportedAt: new Date().toISOString(),
+      sessionCount: sessions.length,
+      sessions,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `myjwnotes-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const importSessions = async (file) => {
+    setBackupMsg('');
+    try {
+      const parsed = JSON.parse(await file.text());
+      const incoming = Array.isArray(parsed) ? parsed : parsed.sessions;
+      if (!Array.isArray(incoming)) throw new Error('That file does not look like a myJWnotes backup.');
+      // Merge rather than replace: same id keeps whichever was edited last, so
+      // importing an old backup can never silently undo newer work.
+      const byId = new Map(sessions.map(s => [s.id, s]));
+      let added = 0, updated = 0;
+      for (const s of incoming) {
+        if (!s || typeof s.id !== 'string') continue;
+        const existing = byId.get(s.id);
+        if (!existing) { byId.set(s.id, s); added++; }
+        else if ((s.updatedAt || 0) > (existing.updatedAt || 0)) { byId.set(s.id, s); updated++; }
+      }
+      const next = Array.from(byId.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      setSessions(next);
+      const ok = await storage.set(STORAGE_KEY, JSON.stringify(next));
+      if (!ok) throw new Error('Imported, but saving failed — storage may be full.');
+      setBackupMsg(`Imported: ${added} new, ${updated} updated, ${incoming.length - added - updated} already current.`);
+    } catch (e) {
+      setBackupMsg(e.message || 'Could not read that backup file.');
+    }
+  };
+
   // ---------------- Styles ----------------
   const palette = {
     parchment: '#f4ecdd',
@@ -2143,15 +2355,17 @@ ${corpus}`;
             </div>
           </div>
           <div className="flex items-center gap-1.5">
-            <button
-              onClick={() => setShowSessions(true)}
-              className="px-3 py-2 rounded-md flex items-center gap-1.5 text-sm transition-colors"
-              style={{ borderWidth: 1, borderColor: palette.line, color: palette.inkSoft }}
-              aria-label="All notes"
-            >
-              <Home className="w-6 h-6" />
-              <span className="hidden sm:inline">All notes</span>
-            </button>
+            {view === 'editor' && (
+              <button
+                onClick={() => { setView('home'); setSearchQuery(''); setLibraryTagFilter(null); clearSeriesSummary(); }}
+                className="px-3 py-2 rounded-md flex items-center gap-1.5 text-sm transition-colors"
+                style={{ borderWidth: 1, borderColor: palette.line, color: palette.inkSoft }}
+                aria-label="All notes"
+              >
+                <Home className="w-6 h-6" />
+                <span className="hidden sm:inline">All notes</span>
+              </button>
+            )}
             <button
               onClick={() => setShowSettings(true)}
               className="p-1.5 rounded-md transition-colors"
@@ -2164,7 +2378,31 @@ ${corpus}`;
         </div>
       </header>
 
-      {/* Main */}
+      {/* Waiting-audio banner — the reassurance that nothing was lost offline */}
+      {(pendingCount > 0 || !isOnline) && (
+        <div style={{ backgroundColor: '#f5e6d8', borderBottomWidth: 1, borderColor: palette.line }}>
+          <div className="max-w-3xl mx-auto px-4 py-2 flex items-center justify-between gap-3">
+            <span className="text-sm" style={{ color: palette.burgundyDeep }}>
+              {pendingCount > 0
+                ? `${pendingCount} recording${pendingCount === 1 ? '' : 's'} saved, waiting to be transcribed`
+                : 'Offline — recordings will be saved and transcribed later'}
+            </span>
+            {pendingCount > 0 && isOnline && (
+              <button
+                onClick={flushPending}
+                disabled={flushing}
+                className="text-sm px-3 py-1 rounded flex items-center gap-1.5 flex-shrink-0 disabled:opacity-50"
+                style={{ backgroundColor: palette.burgundy, color: palette.parchment, fontWeight: 600 }}
+              >
+                {flushing ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Working…</> : 'Transcribe now'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Editor screen */}
+      {view === 'editor' && (<>
       <main className="relative max-w-3xl mx-auto px-4 py-5 pb-32">
         {/* Title */}
         <input
@@ -2674,20 +2912,27 @@ ${corpus}`;
           </button>
         </div>
       </div>
+      </>)}
 
-      {/* Sessions Drawer */}
-      {showSessions && (
-        <div className="fixed inset-0 z-30 flex" onClick={() => { setShowSessions(false); setSearchQuery(''); setLibraryTagFilter(null); clearSeriesSummary(); }}>
-          <div className="flex-1" style={{ backgroundColor: 'rgba(31,26,20,0.4)' }} />
+      {/* Home screen — the app's default view, not a modal */}
+      {view === 'home' && (
+        <div className="w-full">
           <div
-            onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-sm h-full overflow-y-auto flex flex-col"
-            style={{ backgroundColor: palette.parchment, borderLeftWidth: 1, borderColor: palette.line }}
+            className="w-full max-w-3xl mx-auto min-h-screen flex flex-col pb-32"
+            style={{ backgroundColor: palette.parchment }}
           >
             <div className="sticky top-0 z-10" style={{ backgroundColor: palette.parchmentDark, borderBottomWidth: 1, borderColor: palette.line }}>
               <div className="px-4 py-3 flex items-center justify-between">
                 <h2 style={{ ...serifDisplay, fontWeight: 600, fontSize: '1.25rem' }}>{t('library')}</h2>
-                <button onClick={() => { setShowSessions(false); setSearchQuery(''); setLibraryTagFilter(null); clearSeriesSummary(); }} className="p-1"><X className="w-5 h-5" /></button>
+                {libraryTagFilter !== null && (
+                  <button
+                    onClick={() => { setLibraryTagFilter(null); clearSeriesSummary(); }}
+                    className="text-sm px-2 py-1"
+                    style={{ color: palette.burgundy, fontWeight: 600 }}
+                  >
+                    ← {t('tabTags')}
+                  </button>
+                )}
               </div>
 
               {/* Tab nav */}
@@ -2968,6 +3213,26 @@ ${corpus}`;
               })()}
             </div>
           </div>
+
+          {/* Home action bar */}
+          <div className="fixed bottom-0 left-0 right-0 border-t z-10" style={{ backgroundColor: palette.parchment, borderColor: palette.line }}>
+            <div className="max-w-3xl mx-auto px-4 py-3 flex items-center gap-2">
+              <button
+                onClick={() => setShowTemplatePicker(true)}
+                className="px-3 py-3 rounded-md flex items-center gap-1.5 text-sm flex-1 justify-center"
+                style={{ borderWidth: 1, borderColor: palette.line, color: palette.inkSoft }}
+              >
+                <Plus className="w-4 h-4" /> {t('new')}
+              </button>
+              <button
+                onClick={startNewRecording}
+                className="px-4 py-3 rounded-md flex items-center gap-2 text-sm flex-1 justify-center"
+                style={{ backgroundColor: palette.ink, color: palette.parchment, fontWeight: 600 }}
+              >
+                <Mic className="w-4 h-4" /> {t('recordNew')}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -3150,6 +3415,39 @@ ${corpus}`;
                   ? 'Ang KJV, ASV, at WEB ay public domain. Ang NWT ay © Watch Tower at tinitingnan sa jw.org.'
                   : 'KJV, ASV, and WEB are public domain and pulled from bible-api.com. NWT is © Watch Tower and viewed via jw.org.'}
               </p>
+
+              {/* Backup */}
+              <div className="text-xs uppercase tracking-widest mb-2 mt-5 px-1" style={{ color: palette.inkSoft, fontWeight: 600 }}>
+                Backup
+              </div>
+              <p className="text-xs italic mb-2 px-1" style={{ color: palette.inkSoft }}>
+                Your notes are stored only in this browser. Clearing site data or reinstalling the app deletes them permanently — save a backup file somewhere safe.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={exportAllSessions}
+                  disabled={sessions.length === 0}
+                  className="flex-1 px-3 py-3 rounded-md flex items-center justify-center gap-1.5 text-sm disabled:opacity-40"
+                  style={{ borderWidth: 1, borderColor: palette.line, color: palette.inkSoft }}
+                >
+                  <Download className="w-4 h-4" /> Back up {sessions.length > 0 ? `(${sessions.length})` : ''}
+                </button>
+                <label
+                  className="flex-1 px-3 py-3 rounded-md flex items-center justify-center gap-1.5 text-sm cursor-pointer"
+                  style={{ borderWidth: 1, borderColor: palette.line, color: palette.inkSoft }}
+                >
+                  <Plus className="w-4 h-4" /> Restore
+                  <input
+                    type="file"
+                    accept="application/json,.json"
+                    className="hidden"
+                    onChange={(e) => { const f = e.target.files?.[0]; if (f) importSessions(f); e.target.value = ''; }}
+                  />
+                </label>
+              </div>
+              {backupMsg && (
+                <p className="text-xs mt-2 px-1" style={{ color: palette.burgundyDeep }}>{backupMsg}</p>
+              )}
             </div>
           </div>
         </div>
