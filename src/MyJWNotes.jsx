@@ -206,6 +206,85 @@ const LANGUAGES = [
 
 // Speech recognition language codes
 const SPEECH_LANG = { en: 'en-US', tl: 'fil-PH' };
+// Transcription language hint, ISO-639-1 (not BCP-47 like SPEECH_LANG).
+// Empty string means "let the model auto-detect", which is deliberately what
+// Tagalog gets: study notes are typically Taglish, and pinning the language to
+// `tl` makes the model mangle the English scripture terms mixed into the
+// sentences. Set this to 'tl' if you dictate in pure Tagalog.
+const TRANSCRIBE_LANG = { en: 'en', tl: '' };
+
+// ---------------- Microphone capability detection ----------------
+// The Web Speech API is not a microphone API — it is a vendor speech *service*,
+// and it fails in places where mic permission is perfectly fine:
+//   • Brave ships SpeechRecognition but removed the Google backend behind it
+//   • Firefox has it disabled by default
+//   • iOS Safari needs Settings ▸ General ▸ Keyboard ▸ Enable Dictation ON
+//   • iOS home-screen (standalone) PWAs are unreliable across iOS versions
+// So we detect what we can up front, and fall back to recording audio and
+// transcribing it server-side whenever the live path refuses to work.
+const UA = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+const detectEnv = () => {
+  const hasWin = typeof window !== 'undefined';
+  const isIOS =
+    /iPad|iPhone|iPod/.test(UA) ||
+    (/Macintosh/.test(UA) && typeof navigator !== 'undefined' && navigator.maxTouchPoints > 1);
+  let isStandalone = false;
+  if (hasWin) {
+    try {
+      isStandalone =
+        window.matchMedia?.('(display-mode: standalone)').matches === true ||
+        window.navigator.standalone === true;
+    } catch (e) { /* matchMedia unavailable */ }
+  }
+  const isBrave = typeof navigator !== 'undefined' && !!navigator.brave;
+  const isFirefox = /Firefox\//.test(UA);
+  const isChromium = /Chrome\/|CriOS\//.test(UA) && !isBrave;
+  return {
+    isIOS,
+    isStandalone,
+    isBrave,
+    isFirefox,
+    isChromium,
+    hasSR: hasWin && !!(window.SpeechRecognition || window.webkitSpeechRecognition),
+    hasMediaRecorder: hasWin && typeof window.MediaRecorder !== 'undefined',
+    hasGetUserMedia: typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia,
+    isSecure: hasWin ? window.isSecureContext !== false : true,
+  };
+};
+const ENV = detectEnv();
+
+// Browsers that expose SpeechRecognition but cannot actually service it.
+const LIVE_SPEECH_USABLE = ENV.hasSR && !ENV.isBrave && !ENV.isFirefox;
+
+// Preferred recorder container, in order. iOS Safari only offers mp4.
+const pickRecorderMime = () => {
+  if (typeof window === 'undefined' || !window.MediaRecorder) return '';
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/ogg;codecs=opus',
+  ];
+  for (const c of candidates) {
+    try { if (window.MediaRecorder.isTypeSupported(c)) return c; } catch (e) { /* older impl */ }
+  }
+  return '';
+};
+
+const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onloadend = () => {
+    const s = String(reader.result || '');
+    const comma = s.indexOf(',');
+    resolve(comma >= 0 ? s.slice(comma + 1) : '');
+  };
+  reader.onerror = () => reject(new Error('Could not read the recorded audio'));
+  reader.readAsDataURL(blob);
+});
+
+// Length of each recorded chunk in fallback mode. Short enough that text lands
+// in the notes while you are still studying, and that no upload nears 25MB.
+const SEGMENT_MS = 45000;
 // jw.org locale code
 const JW_LOCALE = { en: 'E', tl: 'T' };
 
@@ -1144,6 +1223,12 @@ export default function BibleStudyApp() {
   const [loadingState, setLoadingState] = useState(true);
   const [saveStatus, setSaveStatus] = useState(''); // 'saving', 'saved', ''
   const [recError, setRecError] = useState('');
+  const [recNotice, setRecNotice] = useState('');   // non-fatal info (e.g. fell back to upload mode)
+  const [recMode, setRecMode] = useState(LIVE_SPEECH_USABLE ? 'live' : 'upload'); // 'live' | 'upload'
+  const [transcribing, setTranscribing] = useState(0); // count of segments in flight
+  const [micPermission, setMicPermission] = useState('unknown'); // 'granted'|'denied'|'prompt'|'unknown'
+  const [lastRecErrorCode, setLastRecErrorCode] = useState('');
+  const [showMicDiag, setShowMicDiag] = useState(false);
   const [summary, setSummary] = useState(null); // { headline, themes, scriptures, applications, questions, generatedAt, basedOnLength }
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summaryError, setSummaryError] = useState('');
@@ -1152,6 +1237,14 @@ export default function BibleStudyApp() {
   const shouldKeepListeningRef = useRef(false);
   const notesRef = useRef(null);
   const saveTimerRef = useRef(null);
+  // Fallback-recording plumbing
+  const mediaStreamRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const segmentTimerRef = useRef(null);
+  const chunksRef = useRef([]);
+  const keepSegmentingRef = useRef(false);
+  const recModeRef = useRef(recMode);
+  useEffect(() => { recModeRef.current = recMode; }, [recMode]);
 
   // ---------------- Load fonts ----------------
   useEffect(() => {
@@ -1238,12 +1331,192 @@ export default function BibleStudyApp() {
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
   }, [title, notes, version, summary, tags]); // eslint-disable-line
 
-  // ---------------- Speech recognition setup ----------------
+  // ---------------- Microphone permission probe ----------------
+  // Safari throws on the 'microphone' descriptor, so this is best-effort and
+  // only feeds the diagnostics panel — it never gates recording.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const status = await navigator.permissions.query({ name: 'microphone' });
+        if (cancelled) return;
+        setMicPermission(status.state);
+        status.onchange = () => setMicPermission(status.state);
+      } catch (e) { /* unsupported descriptor — leave as 'unknown' */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const appendTranscript = (text) => {
+    const clean = (text || '').trim();
+    if (!clean) return;
+    setNotes(prev => {
+      const needsSpace = prev && !prev.endsWith(' ') && !prev.endsWith('\n');
+      return prev + (needsSpace ? ' ' : '') + clean + ' ';
+    });
+  };
+
+  // ---------------- Microphone access ----------------
+  // Explicitly requesting the mic is what actually shows the browser's
+  // permission prompt. SpeechRecognition on its own frequently never asks,
+  // which is why "I already allowed the microphone" and "it still fails" can
+  // both be true at once.
+  const ensureMicAccess = async ({ keep }) => {
+    if (!ENV.isSecure) {
+      return { ok: false, message: 'Recording needs a secure connection. Open the site over https:// (or on localhost).' };
+    }
+    if (!ENV.hasGetUserMedia) {
+      return { ok: false, message: 'This browser does not expose microphone access at all. Try Chrome, Edge, or Safari.' };
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setMicPermission('granted');
+      if (!keep) stream.getTracks().forEach(t => t.stop());
+      return { ok: true, stream: keep ? stream : null };
+    } catch (e) {
+      const name = e?.name || 'Error';
+      setLastRecErrorCode(name);
+      if (name === 'NotAllowedError' || name === 'SecurityError') {
+        setMicPermission('denied');
+        return {
+          ok: false,
+          message: ENV.isStandalone
+            ? 'The microphone is blocked for this app. Home-screen web apps often cannot get mic access — open myJWnotes in the browser instead and try there.'
+            : 'The microphone is blocked for this site. Tap the padlock (or "aA") in the address bar and allow the microphone, then try again.',
+        };
+      }
+      if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+        return { ok: false, message: 'No microphone was found on this device.' };
+      }
+      if (name === 'NotReadableError') {
+        return { ok: false, message: 'The microphone is already in use by another app. Close it and try again.' };
+      }
+      return { ok: false, message: `Could not open the microphone (${name}).` };
+    }
+  };
+
+  const releaseStream = () => {
+    try { mediaStreamRef.current?.getTracks().forEach(t => t.stop()); } catch (e) {}
+    mediaStreamRef.current = null;
+  };
+
+  // ---------------- Fallback: record audio, transcribe server-side ----------------
+  const uploadSegment = async (blob, type) => {
+    // A container with no speech in it still weighs a couple of KB.
+    if (!blob || blob.size < 2000) return;
+    setTranscribing(n => n + 1);
+    try {
+      const base64 = await blobToBase64(blob);
+      const response = await fetch('/api/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          audio: base64,
+          mimeType: type,
+          // Omitted entirely when blank, so the server lets the model auto-detect.
+          language: TRANSCRIBE_LANG[contentLanguage] || undefined,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setRecError(data.error || 'Transcription failed for that segment.');
+        return;
+      }
+      appendTranscript(data.text);
+    } catch (e) {
+      setRecError('Could not reach the transcription service — that segment was lost. Check your connection.');
+    } finally {
+      setTranscribing(n => n - 1);
+    }
+  };
+
+  // Records in fixed-length segments rather than one long file: text lands in
+  // the notes while you are still studying, and no upload approaches the API's
+  // per-file size limit.
+  const startSegment = (stream) => {
+    const mime = pickRecorderMime();
+    let mr;
+    try {
+      mr = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    } catch (e) {
+      setRecError('This browser could not start an audio recorder.');
+      keepSegmentingRef.current = false;
+      releaseStream();
+      setIsRecording(false);
+      return;
+    }
+    mediaRecorderRef.current = mr;
+    chunksRef.current = [];
+    mr.ondataavailable = (e) => { if (e.data && e.data.size) chunksRef.current.push(e.data); };
+    mr.onstop = () => {
+      const type = mr.mimeType || mime || 'audio/webm';
+      const blob = new Blob(chunksRef.current, { type });
+      chunksRef.current = [];
+      uploadSegment(blob, type);
+      if (keepSegmentingRef.current && mediaStreamRef.current) {
+        startSegment(mediaStreamRef.current);
+      } else {
+        releaseStream();
+      }
+    };
+    try {
+      mr.start();
+    } catch (e) {
+      setRecError('This browser refused to start recording.');
+      return;
+    }
+    segmentTimerRef.current = setTimeout(() => {
+      try { if (mr.state !== 'inactive') mr.stop(); } catch (e) {}
+    }, SEGMENT_MS);
+  };
+
+  const startUploadRecording = async () => {
+    if (!ENV.hasMediaRecorder) {
+      setRecError('This browser cannot record audio. Try Chrome, Edge, or Safari.');
+      return false;
+    }
+    const access = await ensureMicAccess({ keep: true });
+    if (!access.ok) { setRecError(access.message); return false; }
+    mediaStreamRef.current = access.stream;
+    keepSegmentingRef.current = true;
+    startSegment(access.stream);
+    setIsRecording(true);
+    return true;
+  };
+
+  const stopUploadRecording = () => {
+    keepSegmentingRef.current = false;
+    if (segmentTimerRef.current) { clearTimeout(segmentTimerRef.current); segmentTimerRef.current = null; }
+    try {
+      const mr = mediaRecorderRef.current;
+      if (mr && mr.state !== 'inactive') mr.stop(); // onstop uploads the tail and releases the stream
+      else releaseStream();
+    } catch (e) { releaseStream(); }
+    mediaRecorderRef.current = null;
+  };
+
+  // Switch to the fallback path when the live speech service refuses to serve
+  // us, and keep going without making the user tap record again.
+  const fallBackToUpload = async (why) => {
+    shouldKeepListeningRef.current = false;
+    try { recognitionRef.current?.abort(); } catch (e) {}
+    recognitionRef.current = null;
+    setRecMode('upload');
+    recModeRef.current = 'upload';
+    setRecError('');
+    setRecNotice(`${why} Switched to recording audio and transcribing it as you go — text appears every ${Math.round(SEGMENT_MS / 1000)}s.`);
+    const started = await startUploadRecording();
+    if (!started) setIsRecording(false);
+  };
+
+  // ---------------- Live speech recognition ----------------
   const setupRecognition = useCallback(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return null;
     const rec = new SR();
-    rec.continuous = true;
+    // iOS ignores `continuous` and ends after each utterance; asking for it
+    // there just produces a restart storm.
+    rec.continuous = !ENV.isIOS;
     rec.interimResults = true;
     rec.lang = SPEECH_LANG[contentLanguage] || 'en-US';
     rec.onresult = (event) => {
@@ -1254,29 +1527,48 @@ export default function BibleStudyApp() {
         if (event.results[i].isFinal) finalText += t;
         else interimText += t;
       }
-      if (finalText) {
-        setNotes(prev => {
-          const needsSpace = prev && !prev.endsWith(' ') && !prev.endsWith('\n');
-          return prev + (needsSpace ? ' ' : '') + finalText.trim() + ' ';
-        });
-      }
+      if (finalText) appendTranscript(finalText);
       setInterim(interimText);
     };
     rec.onerror = (e) => {
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-        setRecError('Microphone access blocked. Allow it in your browser settings.');
+      const code = e.error;
+      setLastRecErrorCode(code);
+      if (code === 'no-speech' || code === 'aborted') return; // benign; onend handles restart
+      if (code === 'not-allowed') {
         shouldKeepListeningRef.current = false;
         setIsRecording(false);
-      } else if (e.error === 'no-speech') {
-        // fine, will auto-restart
-      } else {
-        setRecError(`Recording error: ${e.error}`);
+        setRecError(
+          ENV.isStandalone
+            ? 'Microphone permission was refused for this app. Home-screen web apps often cannot get mic access — open myJWnotes in the browser instead.'
+            : 'Microphone permission was refused for this site. Allow it from the padlock in the address bar, then tap record again.'
+        );
+        return;
       }
+      if (code === 'service-not-allowed' || code === 'network' || code === 'language-not-supported') {
+        // Not a permission problem: the browser's speech *service* is the one
+        // saying no. Move to the fallback instead of blaming the microphone.
+        const why =
+          code === 'network'
+            ? 'The live speech service could not be reached.'
+            : ENV.isIOS
+              ? 'Your iPhone blocked its dictation service (turn on Settings ▸ General ▸ Keyboard ▸ Enable Dictation to use the faster live mode).'
+              : 'This browser blocked its speech service — that is not a microphone permission problem.';
+        fallBackToUpload(why);
+        return;
+      }
+      if (code === 'audio-capture') {
+        shouldKeepListeningRef.current = false;
+        setIsRecording(false);
+        setRecError('No microphone was found on this device.');
+        return;
+      }
+      setRecError(`Recording error: ${code}`);
     };
     rec.onend = () => {
       setInterim('');
       if (shouldKeepListeningRef.current) {
-        try { rec.start(); } catch(e) { /* ignore */ }
+        // iOS ends after every utterance, so restarting is normal, not an error.
+        try { rec.start(); } catch (e) { /* already starting */ }
       } else {
         setIsRecording(false);
       }
@@ -1284,28 +1576,83 @@ export default function BibleStudyApp() {
     return rec;
   }, [contentLanguage]);
 
-  const toggleRecording = () => {
-    setRecError('');
-    if (isRecording) {
-      shouldKeepListeningRef.current = false;
-      try { recognitionRef.current?.stop(); } catch(e) {}
-      setIsRecording(false);
-      return;
-    }
+  const startLiveRecording = () => {
     const rec = setupRecognition();
-    if (!rec) {
-      setRecError('Voice recording isn\'t supported in this browser. Try Chrome or Edge.');
-      return;
-    }
+    if (!rec) return false;
     recognitionRef.current = rec;
     shouldKeepListeningRef.current = true;
     try {
       rec.start();
       setIsRecording(true);
-    } catch(e) {
-      setRecError('Could not start recording. Try again.');
+      return true;
+    } catch (e) {
+      shouldKeepListeningRef.current = false;
+      recognitionRef.current = null;
+      return false;
     }
   };
+
+  const stopRecording = () => {
+    shouldKeepListeningRef.current = false;
+    try { recognitionRef.current?.stop(); } catch (e) {}
+    recognitionRef.current = null;
+    stopUploadRecording();
+    setIsRecording(false);
+    setInterim('');
+  };
+
+  const startRecording = async () => {
+    if (!ENV.isSecure) {
+      setRecError('Recording needs a secure connection. Open the site over https:// (or on localhost).');
+      return;
+    }
+    if (recModeRef.current === 'upload' || !LIVE_SPEECH_USABLE) {
+      if (recModeRef.current !== 'upload') {
+        setRecMode('upload');
+        recModeRef.current = 'upload';
+        setRecNotice(
+          ENV.isBrave
+            ? 'Brave removes the live speech service, so myJWnotes records your audio and transcribes it instead.'
+            : ENV.isFirefox
+              ? 'Firefox has no live speech service, so myJWnotes records your audio and transcribes it instead.'
+              : 'Live transcription is unavailable here, so myJWnotes records your audio and transcribes it instead.'
+        );
+      }
+      await startUploadRecording();
+      return;
+    }
+    // Safari (incl. iOS) only starts recognition inside the tap itself, and
+    // awaiting getUserMedia first spends that user gesture. So on iOS we start
+    // straight away and only ask for the mic explicitly if it complains.
+    if (ENV.isIOS) {
+      if (startLiveRecording()) return;
+      const access = await ensureMicAccess({ keep: false });
+      setRecError(access.ok ? 'Microphone is ready — tap record once more to start.' : access.message);
+      return;
+    }
+    const access = await ensureMicAccess({ keep: false });
+    if (!access.ok) { setRecError(access.message); return; }
+    if (!startLiveRecording()) {
+      await fallBackToUpload('Live transcription could not start.');
+    }
+  };
+
+  const toggleRecording = () => {
+    setRecError('');
+    setRecNotice('');
+    if (isRecording) { stopRecording(); return; }
+    startRecording();
+  };
+
+  // Release the mic if the component goes away mid-recording.
+  useEffect(() => () => {
+    keepSegmentingRef.current = false;
+    shouldKeepListeningRef.current = false;
+    if (segmentTimerRef.current) clearTimeout(segmentTimerRef.current);
+    try { recognitionRef.current?.abort(); } catch (e) {}
+    try { mediaRecorderRef.current?.stop(); } catch (e) {}
+    releaseStream();
+  }, []);
 
   // ---------------- Notes textarea: bullet support ----------------
   const handleNotesKey = (e) => {
@@ -1822,7 +2169,11 @@ ${corpus}`;
                 {isRecording ? t('listening') : t('tapToRecord')}
               </div>
               <div className="text-xs italic" style={{ color: palette.inkSoft }}>
-                {isRecording ? t('recordingHint') : t('recordingIdleHint')}
+                {isRecording
+                  ? (recMode === 'upload'
+                      ? `Recording — text appears every ${Math.round(SEGMENT_MS / 1000)}s`
+                      : t('recordingHint'))
+                  : t('recordingIdleHint')}
               </div>
             </div>
           </div>
@@ -1831,9 +2182,44 @@ ${corpus}`;
               … {interim}
             </div>
           )}
+          {transcribing > 0 && (
+            <div className="mt-3 pt-3 border-t text-sm flex items-center gap-2" style={{ borderColor: palette.line, color: palette.inkSoft }}>
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <span className="italic">Transcribing{transcribing > 1 ? ` ${transcribing} segments` : ''}…</span>
+            </div>
+          )}
+          {recNotice && (
+            <div className="mt-3 pt-3 border-t text-sm italic" style={{ borderColor: palette.line, color: palette.inkSoft }}>
+              {recNotice}
+            </div>
+          )}
           {recError && (
             <div className="mt-3 pt-3 border-t text-sm" style={{ borderColor: palette.line, color: palette.burgundyDeep }}>
               {recError}
+            </div>
+          )}
+          {(recError || recNotice) && (
+            <button
+              onClick={() => setShowMicDiag(v => !v)}
+              className="mt-2 text-xs underline"
+              style={{ color: palette.inkSoft }}
+            >
+              {showMicDiag ? 'Hide details' : 'Why isn’t this working?'}
+            </button>
+          )}
+          {showMicDiag && (
+            <div
+              className="mt-2 rounded p-2 text-xs leading-relaxed"
+              style={{ backgroundColor: '#fbf6ea', borderWidth: 1, borderColor: palette.line, color: palette.inkSoft, fontFamily: 'ui-monospace, monospace' }}
+            >
+              <div>browser: {ENV.isBrave ? 'Brave' : ENV.isFirefox ? 'Firefox' : ENV.isChromium ? 'Chromium' : 'Safari/other'}{ENV.isIOS ? ' · iOS' : ''}</div>
+              <div>installed to home screen: {String(ENV.isStandalone)}</div>
+              <div>secure context: {String(ENV.isSecure)}</div>
+              <div>live speech api: {ENV.hasSR ? (LIVE_SPEECH_USABLE ? 'available' : 'present but unusable') : 'missing'}</div>
+              <div>audio recorder: {ENV.hasMediaRecorder ? 'available' : 'missing'}</div>
+              <div>mic permission: {micPermission}</div>
+              <div>mode: {recMode}</div>
+              <div>last error: {lastRecErrorCode || 'none'}</div>
             </div>
           )}
         </div>
