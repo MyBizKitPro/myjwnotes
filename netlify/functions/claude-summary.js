@@ -32,7 +32,11 @@ export const handler = async (event) => {
     };
   }
 
-  const { prompt, maxTokens = 1500, model = 'claude-sonnet-4-20250514' } = body;
+  // claude-sonnet-4-20250514 was retired on 2026-06-15 and now returns a 404
+  // `not_found_error`, which surfaced in the app as "Could not generate summary".
+  // Set SUMMARY_MODEL in Netlify to override.
+  const DEFAULT_MODEL = process.env.SUMMARY_MODEL || 'claude-opus-5';
+  const { prompt, maxTokens = 1500, model = DEFAULT_MODEL } = body;
 
   if (!prompt || typeof prompt !== 'string') {
     return {
@@ -63,7 +67,13 @@ export const handler = async (event) => {
       },
       body: JSON.stringify({
         model,
-        max_tokens: Math.min(Math.max(parseInt(maxTokens, 10) || 1500, 100), 4000),
+        // On Claude Opus 5 thinking is on by default and max_tokens caps
+        // thinking *plus* the reply, so the old 1500–4000 ceiling truncated the
+        // JSON mid-object. Give the reply its budget and add headroom on top.
+        max_tokens: Math.min(Math.max(parseInt(maxTokens, 10) || 1500, 100), 4000) + 4000,
+        // Summarising notes is not an intelligence-sensitive task; low effort
+        // keeps thinking short, which keeps latency and cost down.
+        output_config: { effort: 'low' },
         messages: [{ role: 'user', content: prompt }],
       }),
     });

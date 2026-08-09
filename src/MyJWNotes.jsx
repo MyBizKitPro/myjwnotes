@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, MicOff, BookOpen, Save, Trash2, Download, X, ChevronRight, Clock, Plus, FileText, Loader2, ExternalLink, Settings, Sparkles, RefreshCw, Search, Users, Megaphone, Heart, CalendarDays, Hash, Book } from 'lucide-react';
+import { Mic, MicOff, BookOpen, Save, Trash2, Download, X, ChevronRight, Home, Plus, FileText, Loader2, ExternalLink, Settings, Sparkles, RefreshCw, Search, Users, Megaphone, Heart, CalendarDays, Hash, Book, Copy, Check } from 'lucide-react';
 
 // ---------------- Storage shim ----------------
 // In Claude.ai artifacts, window.storage is provided automatically. In a real
@@ -1232,6 +1232,7 @@ export default function BibleStudyApp() {
   const [summary, setSummary] = useState(null); // { headline, themes, scriptures, applications, questions, generatedAt, basedOnLength }
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summaryError, setSummaryError] = useState('');
+  const [copiedSummary, setCopiedSummary] = useState(''); // '' | 'ok' | 'fail'
 
   const recognitionRef = useRef(null);
   const shouldKeepListeningRef = useRef(false);
@@ -1245,6 +1246,7 @@ export default function BibleStudyApp() {
   const keepSegmentingRef = useRef(false);
   const recModeRef = useRef(recMode);
   useEffect(() => { recModeRef.current = recMode; }, [recMode]);
+  const wakeLockRef = useRef(null);
 
   // ---------------- Load fonts ----------------
   useEffect(() => {
@@ -1346,6 +1348,39 @@ export default function BibleStudyApp() {
     })();
     return () => { cancelled = true; };
   }, []);
+
+  // ---------------- Keep the screen awake while recording ----------------
+  // Same mechanism a video player uses: the Screen Wake Lock API tells the OS
+  // not to dim or lock while this page is visible. iOS Safari has supported it
+  // since 16.4, including home-screen apps. The lock is dropped automatically
+  // whenever the page is hidden, so it has to be re-taken on the way back.
+  const requestWakeLock = async () => {
+    if (!('wakeLock' in navigator)) return false;
+    try {
+      wakeLockRef.current = await navigator.wakeLock.request('screen');
+      wakeLockRef.current.addEventListener?.('release', () => { wakeLockRef.current = null; });
+      return true;
+    } catch (e) {
+      // Thrown when the page is hidden or the OS refuses (e.g. low power mode).
+      return false;
+    }
+  };
+
+  const releaseWakeLock = () => {
+    try { wakeLockRef.current?.release(); } catch (e) {}
+    wakeLockRef.current = null;
+  };
+
+  // Re-acquire after the screen was locked, an app switch, or a tab change.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible' && isRecording && !wakeLockRef.current) {
+        requestWakeLock();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [isRecording]);
 
   const appendTranscript = (text) => {
     const clean = (text || '').trim();
@@ -1641,8 +1676,15 @@ export default function BibleStudyApp() {
     setRecError('');
     setRecNotice('');
     if (isRecording) { stopRecording(); return; }
+    // Taken inside the tap, before any await, so the gesture is still live.
+    requestWakeLock();
     startRecording();
   };
+
+  // Covers every way recording can end — stop, error, or a start that failed.
+  useEffect(() => {
+    if (!isRecording) releaseWakeLock();
+  }, [isRecording]);
 
   // Release the mic if the component goes away mid-recording.
   useEffect(() => () => {
@@ -1652,6 +1694,7 @@ export default function BibleStudyApp() {
     try { recognitionRef.current?.abort(); } catch (e) {}
     try { mediaRecorderRef.current?.stop(); } catch (e) {}
     releaseStream();
+    releaseWakeLock();
   }, []);
 
   // ---------------- Notes textarea: bullet support ----------------
@@ -1875,6 +1918,69 @@ ${notes}`;
     setSummaryError('');
   };
 
+  // ---------------- Copy summary (for pasting into another notes app) ----------------
+  // Plain text rather than Markdown: it pastes cleanly into apps that don't
+  // render Markdown, and reads fine in the ones that do.
+  const summaryToText = (s, heading) => {
+    if (!s) return '';
+    const lines = [];
+    if (heading) lines.push(heading, '');
+    if (s.headline) lines.push(s.headline, '');
+    if (s.themes?.length) {
+      lines.push(`${t('keyThemes')}:`);
+      s.themes.forEach(x => lines.push(`  • ${x}`));
+      lines.push('');
+    }
+    if (s.scriptures?.length) {
+      lines.push(`${t('scriptureInsights')}:`);
+      s.scriptures.forEach(x => lines.push(`  • ${x.ref}${x.insight ? ` — ${x.insight}` : ''}`));
+      lines.push('');
+    }
+    if (s.applications?.length) {
+      lines.push(`${t('apply')}:`);
+      s.applications.forEach(x => lines.push(`  • ${x}`));
+      lines.push('');
+    }
+    if (s.questions?.length) {
+      lines.push(`${t('reflect')}:`);
+      s.questions.forEach(x => lines.push(`  • ${x}`));
+      lines.push('');
+    }
+    return lines.join('\n').trim();
+  };
+
+  const copyText = async (text) => {
+    if (!text) return false;
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      // Older WebKit, or a clipboard write the browser refused outside a gesture.
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length); // iOS ignores select() alone
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+      } catch (e2) {
+        return false;
+      }
+    }
+  };
+
+  const copySummary = async () => {
+    const heading = title?.trim() || t('untitled');
+    const ok = await copyText(summaryToText(summary, heading));
+    setCopiedSummary(ok ? 'ok' : 'fail');
+    setTimeout(() => setCopiedSummary(''), 2000);
+  };
+
   // detect if notes have changed significantly since summary was generated
   const summaryStale = summary && Math.abs(notes.length - (summary.basedOnLength || 0)) > 50;
 
@@ -2039,11 +2145,12 @@ ${corpus}`;
           <div className="flex items-center gap-1.5">
             <button
               onClick={() => setShowSessions(true)}
-              className="px-2.5 py-1.5 rounded-md flex items-center gap-1.5 text-sm transition-colors"
+              className="px-3 py-2 rounded-md flex items-center gap-1.5 text-sm transition-colors"
               style={{ borderWidth: 1, borderColor: palette.line, color: palette.inkSoft }}
+              aria-label="All notes"
             >
-              <Clock className="w-4 h-4" />
-              <span className="hidden sm:inline">Sessions</span>
+              <Home className="w-6 h-6" />
+              <span className="hidden sm:inline">All notes</span>
             </button>
             <button
               onClick={() => setShowSettings(true)}
@@ -2401,6 +2508,24 @@ ${corpus}`;
                   )}
                 </div>
                 <div className="flex items-center gap-1">
+                  <button
+                    onClick={copySummary}
+                    title="Copy summary"
+                    aria-label="Copy summary"
+                    className="px-2 py-1.5 rounded flex items-center gap-1 text-xs"
+                    style={{
+                      color: copiedSummary === 'ok' ? palette.burgundy : palette.inkSoft,
+                      borderWidth: 1,
+                      borderColor: palette.line,
+                      fontWeight: 600,
+                    }}
+                  >
+                    {copiedSummary === 'ok'
+                      ? <><Check className="w-3.5 h-3.5" /> Copied</>
+                      : copiedSummary === 'fail'
+                        ? <><Copy className="w-3.5 h-3.5" /> Failed</>
+                        : <><Copy className="w-3.5 h-3.5" /> Copy</>}
+                  </button>
                   <button
                     onClick={generateSummary}
                     title="Regenerate"
